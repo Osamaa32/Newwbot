@@ -102,32 +102,36 @@ class AccountSession:
             await self.db.update_account(self.phone, last_error=str(e)[:200], is_active=0)
             return False
 
-    async def send_code(self) -> Tuple[bool, str, Any]:
-        """Send verification code - uses StringSession for Railway
-        Returns: (success, phone_code_hash, client) - client is kept alive for sign_in"""
+    async def start_auth(self) -> Tuple[bool, str, Any]:
+        """Start auth flow - create client and send code
+        Returns: (success, message, client) - client is kept alive for sign_in"""
         try:
             # Use StringSession (no local files needed)
             session = StringSession(self.session_string) if self.session_string else StringSession()
             self.client = TelegramClient(session, self.api_id, self.api_hash)
             await self.client.connect()
 
-            result = await self.client.send_code_request(self.phone)
-            logger.info(f"Code sent to {self.phone}, hash: {result.phone_code_hash[:10]}...")
-            return True, result.phone_code_hash, self.client
+            # Telethon stores phone_code_hash internally in the session!
+            await self.client.send_code_request(self.phone)
+            logger.info(f"Code sent to {self.phone}")
+            return True, "Code sent", self.client
 
         except Exception as e:
             logger.error(f"Failed to send code to {self.phone}: {e}")
             return False, str(e), None
 
-    async def sign_in(self, code: str, phone_code_hash: str) -> Tuple[bool, str]:
-        """Sign in with code - saves StringSession to database"""
+    async def submit_code(self, code: str) -> Tuple[bool, str]:
+        """Submit code - Telethon uses internal phone_code_hash automatically
+        This is why we MUST use the same client object!"""
         try:
-            await self.client.sign_in(self.phone, code, phone_code_hash=phone_code_hash)
+            # Telethon automatically uses the stored phone_code_hash
+            # Do NOT pass it manually - it causes "code expired" errors
+            await self.client.sign_in(self.phone, code)
             me = await self.client.get_me()
             self.me_id = me.id
             self.is_active = True
 
-            # Save session string to database (works on Railway without persistent storage!)
+            # Save session string to database
             self.session_string = self.client.session.save()
             await self.db.update_account(
                 self.phone,
@@ -860,25 +864,21 @@ class ControlBot:
             await self.db.update_account(phone, is_active=1, enabled=1)
             await event.reply(f"✅ تم تشغيل الحساب `{phone}` بنجاح!")
         else:
-            # Need authentication - send code
-            success, result, client = await account.send_code()
+            # Need authentication - start flow
+            success, msg, client = await account.start_auth()
             if success:
                 self._pending_codes[phone] = {
-                    'hash': result,
                     'account': account,
-                    'client': client,  # Keep same client alive!
-                    'api_id': account_data['api_id'],
-                    'api_hash': account_data['api_hash'],
-                    'sent_at': time.time()  # Track when code was sent
+                    'client': client,  # Keep same client alive - CRITICAL!
                 }
                 await event.reply(
                     f"📩 تم إرسال كود التحقق إلى `{phone}`.\n"
                     f"أرسل الكود الآن: `/verify {phone} 12345`\n\n"
-                    f"⚡ **الكود صالح لـ 2 دقيقة!** اسرع!\n"
+                    f"⚡ **اكتب الكود بسرعة!**\n"
                     f"إذا كان الحساب يحتوي على 2FA، ستتم مطالبتك بكلمة المرور بعدها."
                 )
             else:
-                await event.reply(f"❌ فشل إرسال الكود: `{result}`")
+                await event.reply(f"❌ فشل إرسال الكود: `{msg}`")
 
     async def _cmd_verify(self, event, args):
         if len(args) < 2:
@@ -895,15 +895,16 @@ class ControlBot:
         pending = self._pending_codes[phone]
         account = pending['account']
 
-        # Use the SAME client from send_code (kept alive!)
-        # Replace account's client with the pending one
+        # Use the SAME client from start_auth (kept alive!)
+        # Telethon stores phone_code_hash internally - we don't pass it
         account.client = pending['client']
 
         # Ensure client is connected
         if not account.client.is_connected():
             await account.client.connect()
 
-        success, result = await account.sign_in(code, pending['hash'])
+        # submit_code uses Telethon's internal hash automatically
+        success, result = await account.submit_code(code)
 
         if success:
             self.dispatcher.register_account(account)
