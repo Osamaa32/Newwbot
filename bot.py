@@ -68,17 +68,10 @@ class AccountSession:
         self.joined_groups: Set[int] = set()
 
     async def create_client(self) -> bool:
-        """Create and connect Telegram client"""
+        """Create and connect Telegram client - uses StringSession for Railway"""
         try:
-            # Use session string if available (for Railway persistence)
-            if self.session_string:
-                session = StringSession(self.session_string)
-            else:
-                # Use file-based session as fallback
-                session_name = f"sessions/{self.phone.replace('+', '')}"
-                os.makedirs("sessions", exist_ok=True)
-                from telethon.sessions import SQLiteSession
-                session = session_name
+            # Always use StringSession (saved in database) - no files needed!
+            session = StringSession(self.session_string) if self.session_string else StringSession()
 
             self.client = TelegramClient(session, self.api_id, self.api_hash)
             await self.client.connect()
@@ -91,15 +84,14 @@ class AccountSession:
             self.me_id = me.id
             self.is_active = True
 
-            # Save session string for persistence
-            if hasattr(self.client.session, 'save'):
-                self.session_string = self.client.session.save()
-                await self.db.update_account(
-                    self.phone,
-                    session_string=self.session_string,
-                    is_active=1,
-                    last_error=None
-                )
+            # Save session string to database for persistence across restarts
+            self.session_string = self.client.session.save()
+            await self.db.update_account(
+                self.phone,
+                session_string=self.session_string,
+                is_active=1,
+                last_error=None
+            )
 
             logger.info(f"Account {self.phone} connected successfully (ID: {self.me_id})")
             return True
@@ -111,11 +103,11 @@ class AccountSession:
             return False
 
     async def send_code(self) -> Tuple[bool, str]:
-        """Send verification code"""
+        """Send verification code - uses StringSession for Railway"""
         try:
-            session_name = f"sessions/{self.phone.replace('+', '')}"
-            os.makedirs("sessions", exist_ok=True)
-            self.client = TelegramClient(session_name, self.api_id, self.api_hash)
+            # Use StringSession (no local files needed)
+            session = StringSession(self.session_string) if self.session_string else StringSession()
+            self.client = TelegramClient(session, self.api_id, self.api_hash)
             await self.client.connect()
 
             result = await self.client.send_code_request(self.phone)
@@ -126,21 +118,21 @@ class AccountSession:
             return False, str(e)
 
     async def sign_in(self, code: str, phone_code_hash: str) -> Tuple[bool, str]:
-        """Sign in with code"""
+        """Sign in with code - saves StringSession to database"""
         try:
             await self.client.sign_in(self.phone, code, phone_code_hash=phone_code_hash)
             me = await self.client.get_me()
             self.me_id = me.id
             self.is_active = True
 
-            if hasattr(self.client.session, 'save'):
-                self.session_string = self.client.session.save()
-                await self.db.update_account(
-                    self.phone,
-                    session_string=self.session_string,
-                    is_active=1,
-                    last_error=None
-                )
+            # Save session string to database (works on Railway without persistent storage!)
+            self.session_string = self.client.session.save()
+            await self.db.update_account(
+                self.phone,
+                session_string=self.session_string,
+                is_active=1,
+                last_error=None
+            )
 
             return True, "Successfully signed in"
 
@@ -152,21 +144,21 @@ class AccountSession:
             return False, str(e)
 
     async def sign_in_2fa(self, password: str) -> Tuple[bool, str]:
-        """Sign in with 2FA password"""
+        """Sign in with 2FA password - saves StringSession to database"""
         try:
             await self.client.sign_in(password=password)
             me = await self.client.get_me()
             self.me_id = me.id
             self.is_active = True
 
-            if hasattr(self.client.session, 'save'):
-                self.session_string = self.client.session.save()
-                await self.db.update_account(
-                    self.phone,
-                    session_string=self.session_string,
-                    is_active=1,
-                    last_error=None
-                )
+            # Save session string to database (works on Railway without persistent storage!)
+            self.session_string = self.client.session.save()
+            await self.db.update_account(
+                self.phone,
+                session_string=self.session_string,
+                is_active=1,
+                last_error=None
+            )
 
             return True, "Successfully signed in with 2FA"
 
