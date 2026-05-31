@@ -102,8 +102,9 @@ class AccountSession:
             await self.db.update_account(self.phone, last_error=str(e)[:200], is_active=0)
             return False
 
-    async def send_code(self) -> Tuple[bool, str]:
-        """Send verification code - uses StringSession for Railway"""
+    async def send_code(self) -> Tuple[bool, str, Any]:
+        """Send verification code - uses StringSession for Railway
+        Returns: (success, phone_code_hash, client) - client is kept alive for sign_in"""
         try:
             # Use StringSession (no local files needed)
             session = StringSession(self.session_string) if self.session_string else StringSession()
@@ -111,11 +112,12 @@ class AccountSession:
             await self.client.connect()
 
             result = await self.client.send_code_request(self.phone)
-            return True, result.phone_code_hash
+            logger.info(f"Code sent to {self.phone}, hash: {result.phone_code_hash[:10]}...")
+            return True, result.phone_code_hash, self.client
 
         except Exception as e:
             logger.error(f"Failed to send code to {self.phone}: {e}")
-            return False, str(e)
+            return False, str(e), None
 
     async def sign_in(self, code: str, phone_code_hash: str) -> Tuple[bool, str]:
         """Sign in with code - saves StringSession to database"""
@@ -859,17 +861,20 @@ class ControlBot:
             await event.reply(f"✅ تم تشغيل الحساب `{phone}` بنجاح!")
         else:
             # Need authentication - send code
-            success, result = await account.send_code()
+            success, result, client = await account.send_code()
             if success:
                 self._pending_codes[phone] = {
                     'hash': result,
                     'account': account,
+                    'client': client,  # Keep same client alive!
                     'api_id': account_data['api_id'],
-                    'api_hash': account_data['api_hash']
+                    'api_hash': account_data['api_hash'],
+                    'sent_at': time.time()  # Track when code was sent
                 }
                 await event.reply(
                     f"📩 تم إرسال كود التحقق إلى `{phone}`.\n"
                     f"أرسل الكود الآن: `/verify {phone} 12345`\n\n"
+                    f"⚡ **الكود صالح لـ 2 دقيقة!** اسرع!\n"
                     f"إذا كان الحساب يحتوي على 2FA، ستتم مطالبتك بكلمة المرور بعدها."
                 )
             else:
@@ -890,6 +895,14 @@ class ControlBot:
         pending = self._pending_codes[phone]
         account = pending['account']
 
+        # Use the SAME client from send_code (kept alive!)
+        # Replace account's client with the pending one
+        account.client = pending['client']
+
+        # Ensure client is connected
+        if not account.client.is_connected():
+            await account.client.connect()
+
         success, result = await account.sign_in(code, pending['hash'])
 
         if success:
@@ -898,14 +911,26 @@ class ControlBot:
             del self._pending_codes[phone]
             await event.reply(f"✅ تم توثيق وتشغيل الحساب `{phone}` بنجاح!")
         elif result == "2FA_REQUIRED":
-            self._pending_2fa[phone] = {'account': account}
+            self._pending_2fa[phone] = {'account': account, 'client': account.client}
             del self._pending_codes[phone]
             await event.reply(
                 f"🔐 الحساب `{phone}` يتطلب 2FA.\n"
                 f"أرسل كلمة المرور: `/verify2fa {phone} <password>`"
             )
         else:
-            await event.reply(f"❌ فشل التوثيق: `{result}`")
+            # Clean up failed client
+            try:
+                await account.client.disconnect()
+            except Exception:
+                pass
+            del self._pending_codes[phone]
+            await event.reply(
+                f"❌ فشل التوثيق: `{result}`\n\n"
+                f"💡 **نصائح:**\n"
+                f"• تأكد من إدخال الكود الصحيح بدون مسافات\n"
+                f"• الكود يتكون من أرقام فقط (مثال: 12345)\n"
+                f"• أعد المحاولة بـ `/startacc {phone}` مرة أخرى"
+            )
 
     async def _cmd_verify_2fa(self, event, args):
         if len(args) < 2:
@@ -919,7 +944,16 @@ class ControlBot:
             await event.reply("⚠️ لا يوجد طلب 2FA معلق.")
             return
 
-        account = self._pending_2fa[phone]['account']
+        pending = self._pending_2fa[phone]
+        account = pending['account']
+
+        # Use the SAME client
+        account.client = pending['client']
+
+        # Ensure client is connected
+        if not account.client.is_connected():
+            await account.client.connect()
+
         success, result = await account.sign_in_2fa(password)
 
         if success:
@@ -928,7 +962,10 @@ class ControlBot:
             del self._pending_2fa[phone]
             await event.reply(f"✅ تم توثيق الحساب `{phone}` بنجاح مع 2FA!")
         else:
-            await event.reply(f"❌ فشل التوثيق: `{result}`")
+            await event.reply(
+                f"❌ فشل التوثيق: `{result}`\n\n"
+                f"💡 تأكد من صحة كلمة المرور ثنائية العوامل وأعد المحاولة."
+            )
 
     async def _cmd_stop_account(self, event, args):
         if not args:
