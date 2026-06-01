@@ -102,42 +102,32 @@ class AccountSession:
             await self.db.update_account(self.phone, last_error=str(e)[:200], is_active=0)
             return False
 
-    async def send_code(self) -> Tuple[bool, str, str]:
-        """Send verification code.
-        Returns: (success, phone_code_hash, session_string)"""
+    async def send_code(self) -> Tuple[bool, str]:
+        """Send verification code. Keeps client ALIVE in memory."""
         try:
             session = StringSession(self.session_string) if self.session_string else StringSession()
             self.client = TelegramClient(session, self.api_id, self.api_hash)
             await self.client.connect()
 
-            result = await self.client.send_code_request(self.phone)
-
-            # Save session string immediately (contains auth state)
-            session_string = self.client.session.save()
-            logger.info(f"Code sent to {self.phone}, session saved")
-
-            return True, result.phone_code_hash, session_string
+            await self.client.send_code_request(self.phone)
+            logger.info(f"Code sent to {self.phone}")
+            return True, "sent"
 
         except Exception as e:
             logger.error(f"Failed to send code to {self.phone}: {e}")
-            return False, str(e), ""
+            return False, str(e)
 
-    async def sign_in(self, code: str, phone_code_hash: str, session_string: str) -> Tuple[bool, str]:
-        """Sign in with code. Creates NEW client from session_string + hash."""
+    async def sign_in(self, code: str) -> Tuple[bool, str]:
+        """Sign in with code. REQUIRES same client from send_code to be alive!"""
         try:
-            # Create new client from saved session string
-            session = StringSession(session_string)
-            self.client = TelegramClient(session, self.api_id, self.api_hash)
-            await self.client.connect()
-
-            # Pass hash explicitly
-            await self.client.sign_in(self.phone, code, phone_code_hash=phone_code_hash)
+            # Use SAME client - phone_code_hash is stored internally by Telethon
+            await self.client.sign_in(self.phone, code)
 
             me = await self.client.get_me()
             self.me_id = me.id
             self.is_active = True
 
-            # Save final session string
+            # Save final session string for future reconnects
             self.session_string = self.client.session.save()
             await self.db.update_account(
                 self.phone,
@@ -877,22 +867,23 @@ class ControlBot:
             await event.reply(f"✅ تم تشغيل الحساب `{phone}` بنجاح!")
         else:
             # Need authentication - send code
-            success, hash_code, session_str = await account.send_code()
+            success, result = await account.send_code()
             if success:
-                # Store auth data - works even after Railway restart!
+                # CRITICAL: Store the ALIVE client in memory
+                # phone_code_hash is stored INSIDE the Telethon client object
+                # We MUST use the exact same client object for sign_in!
                 self._pending_codes[phone] = {
-                    'hash': hash_code,           # phone_code_hash
-                    'session': session_str,       # session_string
+                    'client': account.client,  # SAME client - alive in memory
                     'account': account,
                 }
                 await event.reply(
                     f"📩 تم إرسال كود التحقق إلى `{phone}`.\n"
                     f"أرسل الكود الآن: `/verify {phone} 12345`\n\n"
                     f"⚡ **اكتب الكود بسرعة!**\n"
-                    f"إذا كان الحساب يحتوي على 2FA، ستتم مطالبتك بكلمة المرور بعدها."
+                    f"الكود صالح لدقيقتين."
                 )
             else:
-                await event.reply(f"❌ فشل إرسال الكود: `{hash_code}`")
+                await event.reply(f"❌ فشل إرسال الكود: `{result}`")
 
     async def _cmd_verify(self, event, args):
         if len(args) < 2:
@@ -908,12 +899,18 @@ class ControlBot:
 
         pending = self._pending_codes[phone]
         account = pending['account']
-        phone_code_hash = pending['hash']
-        session_string = pending['session']
 
-        # Create NEW client from saved session + explicit hash
-        # This works even after Railway restart!
-        success, result = await account.sign_in(code, phone_code_hash, session_string)
+        # CRITICAL: Use the SAME client from send_code!
+        # phone_code_hash lives INSIDE the Telethon client object.
+        # Creating a new client loses the hash - that's why it kept expiring.
+        account.client = pending['client']
+
+        # Ensure client is still connected
+        if not account.client.is_connected():
+            logger.warning("Client disconnected, reconnecting...")
+            await account.client.connect()
+
+        success, result = await account.sign_in(code)
 
         if success:
             self.dispatcher.register_account(account)
@@ -921,7 +918,7 @@ class ControlBot:
             del self._pending_codes[phone]
             await event.reply(f"✅ تم توثيق وتشغيل الحساب `{phone}` بنجاح!")
         elif result == "2FA_REQUIRED":
-            self._pending_2fa[phone] = {'account': account, 'session': session_string}
+            self._pending_2fa[phone] = {'account': account, 'client': account.client}
             del self._pending_codes[phone]
             await event.reply(
                 f"🔐 الحساب `{phone}` يتطلب 2FA.\n"
@@ -931,10 +928,7 @@ class ControlBot:
             del self._pending_codes[phone]
             await event.reply(
                 f"❌ فشل التوثيق: `{result}`\n\n"
-                f"💡 **نصائح:**\n"
-                f"• تأكد من إدخال الكود الصحيح بدون مسافات\n"
-                f"• الكود صالح لدقيقتين فقط - اكتبه بسرعة\n"
-                f"• أعد المحاولة بـ `/startacc {phone}` مرة أخرى"
+                f"💡 أعد المحاولة بـ `/startacc {phone}`"
             )
 
     async def _cmd_verify_2fa(self, event, args):
@@ -951,10 +945,14 @@ class ControlBot:
 
         pending = self._pending_2fa[phone]
         account = pending['account']
-        session_string = pending.get('session', '')
 
-        # Pass session_string to recreate client if needed
-        success, result = await account.sign_in_2fa(password, session_string)
+        # Use SAME client from verify step
+        account.client = pending['client']
+
+        if not account.client.is_connected():
+            await account.client.connect()
+
+        success, result = await account.sign_in_2fa(password)
 
         if success:
             self.dispatcher.register_account(account)
