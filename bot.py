@@ -23,7 +23,7 @@ from collections import deque
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.types import Channel, Chat, User
+from telethon.tl.types import Channel, Chat, User, CodeSettings
 from telethon.tl.functions.auth import SendCodeRequest, SignInRequest
 from telethon.errors import (
     FloodWaitError, UserIsBlockedError, MessageTooLongError,
@@ -161,7 +161,7 @@ class AccountSession:
                 phone_number=self.phone,
                 api_id=self.api_id,
                 api_hash=self.api_hash,
-                settings=types.CodeSettings(allow_flashcall=False, current_number=False, allow_app_hash=False)
+                settings=CodeSettings(allow_flashcall=False, current_number=False, allow_app_hash=False)
             ))
 
             phone_code_hash = result.phone_code_hash
