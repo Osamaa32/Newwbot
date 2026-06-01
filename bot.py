@@ -102,38 +102,42 @@ class AccountSession:
             await self.db.update_account(self.phone, last_error=str(e)[:200], is_active=0)
             return False
 
-    async def send_code(self) -> Tuple[bool, str]:
-        """Send verification code, store hash internally"""
+    async def send_code(self) -> Tuple[bool, str, str]:
+        """Send verification code.
+        Returns: (success, phone_code_hash, session_string)"""
         try:
             session = StringSession(self.session_string) if self.session_string else StringSession()
             self.client = TelegramClient(session, self.api_id, self.api_hash)
             await self.client.connect()
 
             result = await self.client.send_code_request(self.phone)
-            self._phone_code_hash = result.phone_code_hash  # Store hash
-            logger.info(f"Code sent to {self.phone}")
-            return True, result.phone_code_hash
+
+            # Save session string immediately (contains auth state)
+            session_string = self.client.session.save()
+            logger.info(f"Code sent to {self.phone}, session saved")
+
+            return True, result.phone_code_hash, session_string
 
         except Exception as e:
             logger.error(f"Failed to send code to {self.phone}: {e}")
-            return False, str(e)
+            return False, str(e), ""
 
-    async def sign_in(self, code: str, phone_code_hash: str = None) -> Tuple[bool, str]:
-        """Sign in with code. MUST pass the same phone_code_hash from send_code!"""
+    async def sign_in(self, code: str, phone_code_hash: str, session_string: str) -> Tuple[bool, str]:
+        """Sign in with code. Creates NEW client from session_string + hash."""
         try:
-            # Use provided hash, or fall back to stored one
-            hash_to_use = phone_code_hash or getattr(self, '_phone_code_hash', None)
+            # Create new client from saved session string
+            session = StringSession(session_string)
+            self.client = TelegramClient(session, self.api_id, self.api_hash)
+            await self.client.connect()
 
-            if hash_to_use:
-                await self.client.sign_in(self.phone, code, phone_code_hash=hash_to_use)
-            else:
-                await self.client.sign_in(self.phone, code)
+            # Pass hash explicitly
+            await self.client.sign_in(self.phone, code, phone_code_hash=phone_code_hash)
 
             me = await self.client.get_me()
             self.me_id = me.id
             self.is_active = True
 
-            # Save session string to database
+            # Save final session string
             self.session_string = self.client.session.save()
             await self.db.update_account(
                 self.phone,
@@ -151,15 +155,21 @@ class AccountSession:
         except Exception as e:
             return False, str(e)
 
-    async def sign_in_2fa(self, password: str) -> Tuple[bool, str]:
+    async def sign_in_2fa(self, password: str, session_string: str = None) -> Tuple[bool, str]:
         """Sign in with 2FA password - saves StringSession to database"""
         try:
+            # If session_string provided, create new client
+            if session_string:
+                session = StringSession(session_string)
+                self.client = TelegramClient(session, self.api_id, self.api_hash)
+                await self.client.connect()
+
             await self.client.sign_in(password=password)
             me = await self.client.get_me()
             self.me_id = me.id
             self.is_active = True
 
-            # Save session string to database (works on Railway without persistent storage!)
+            # Save session string to database
             self.session_string = self.client.session.save()
             await self.db.update_account(
                 self.phone,
@@ -867,12 +877,13 @@ class ControlBot:
             await event.reply(f"✅ تم تشغيل الحساب `{phone}` بنجاح!")
         else:
             # Need authentication - send code
-            success, result = await account.send_code()
+            success, hash_code, session_str = await account.send_code()
             if success:
+                # Store auth data - works even after Railway restart!
                 self._pending_codes[phone] = {
-                    'hash': result,     # phone_code_hash from Telegram
+                    'hash': hash_code,           # phone_code_hash
+                    'session': session_str,       # session_string
                     'account': account,
-                    'client': account.client,  # Same client - CRITICAL!
                 }
                 await event.reply(
                     f"📩 تم إرسال كود التحقق إلى `{phone}`.\n"
@@ -881,7 +892,7 @@ class ControlBot:
                     f"إذا كان الحساب يحتوي على 2FA، ستتم مطالبتك بكلمة المرور بعدها."
                 )
             else:
-                await event.reply(f"❌ فشل إرسال الكود: `{result}`")
+                await event.reply(f"❌ فشل إرسال الكود: `{hash_code}`")
 
     async def _cmd_verify(self, event, args):
         if len(args) < 2:
@@ -898,16 +909,11 @@ class ControlBot:
         pending = self._pending_codes[phone]
         account = pending['account']
         phone_code_hash = pending['hash']
+        session_string = pending['session']
 
-        # Use the SAME client
-        account.client = pending['client']
-
-        # Ensure client is connected
-        if not account.client.is_connected():
-            await account.client.connect()
-
-        # Pass the EXACT phone_code_hash from send_code()
-        success, result = await account.sign_in(code, phone_code_hash=phone_code_hash)
+        # Create NEW client from saved session + explicit hash
+        # This works even after Railway restart!
+        success, result = await account.sign_in(code, phone_code_hash, session_string)
 
         if success:
             self.dispatcher.register_account(account)
@@ -915,18 +921,13 @@ class ControlBot:
             del self._pending_codes[phone]
             await event.reply(f"✅ تم توثيق وتشغيل الحساب `{phone}` بنجاح!")
         elif result == "2FA_REQUIRED":
-            self._pending_2fa[phone] = {'account': account, 'client': account.client}
+            self._pending_2fa[phone] = {'account': account, 'session': session_string}
             del self._pending_codes[phone]
             await event.reply(
                 f"🔐 الحساب `{phone}` يتطلب 2FA.\n"
                 f"أرسل كلمة المرور: `/verify2fa {phone} <password>`"
             )
         else:
-            # Clean up failed client
-            try:
-                await account.client.disconnect()
-            except Exception:
-                pass
             del self._pending_codes[phone]
             await event.reply(
                 f"❌ فشل التوثيق: `{result}`\n\n"
@@ -950,15 +951,10 @@ class ControlBot:
 
         pending = self._pending_2fa[phone]
         account = pending['account']
+        session_string = pending.get('session', '')
 
-        # Use the SAME client
-        account.client = pending['client']
-
-        # Ensure client is connected
-        if not account.client.is_connected():
-            await account.client.connect()
-
-        success, result = await account.sign_in_2fa(password)
+        # Pass session_string to recreate client if needed
+        success, result = await account.sign_in_2fa(password, session_string)
 
         if success:
             self.dispatcher.register_account(account)
