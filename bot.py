@@ -2,7 +2,12 @@
 Telegram Bot Manager - Main Module
 Multi-account Telegram bot with auto-reply and forward capabilities
 Optimized for high-speed processing across thousands of groups
-Railway-compatible with persistent storage
+Railway-compatible with PostgreSQL persistent storage
+
+Auth Flow:
+  1. send_code: creates client, sends SendCodeRequest, saves session_string + phone_code_hash to DB
+  2. sign_in: creates NEW client from session_string, sends SignInRequest with explicit phone_code_hash
+  This works even after Railway restart because all state is in the database!
 """
 import os
 import sys
@@ -19,24 +24,23 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.types import Channel, Chat, User
+from telethon.tl.functions.auth import SendCodeRequest, SignInRequest
 from telethon.errors import (
     FloodWaitError, UserIsBlockedError, MessageTooLongError,
     AuthKeyDuplicatedError, UserAlreadyParticipantError,
     ChannelInvalidError, ChannelPrivateError, PhoneCodeInvalidError,
-    SessionPasswordNeededError, PasswordHashInvalidError
+    PhoneCodeExpiredError, SessionPasswordNeededError, PasswordHashInvalidError
 )
 
 from config import Config
 from database import Database
-from utils import TextProcessor, Cache, RateLimiter, MetricsCollector, async_retry, format_phone, escape_markdown
+from utils import TextProcessor, Cache, RateLimiter, MetricsCollector, async_retry, format_phone
 
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
@@ -53,7 +57,7 @@ class AccountSession:
         self.api_id = api_id
         self.api_hash = api_hash
         self.target_group_id = target_group_id
-        self.mode = mode  # 'forward', 'reply', 'both', 'self'
+        self.mode = mode
         self.db = db
         self.session_string = session_string
 
@@ -67,13 +71,44 @@ class AccountSession:
         self.last_error: Optional[str] = None
         self.joined_groups: Set[int] = set()
 
-    async def create_client(self) -> bool:
-        """Create and connect Telegram client - uses StringSession for Railway"""
-        try:
-            # Always use StringSession (saved in database) - no files needed!
-            session = StringSession(self.session_string) if self.session_string else StringSession()
+    # ---- Auth State (stored in DB, survives restart) ----
 
-            self.client = TelegramClient(session, self.api_id, self.api_hash)
+    async def load_auth_state(self) -> Optional[Dict]:
+        """Load pending auth state from database (survives restart)"""
+        try:
+            raw = await self.db.get_setting(f"auth_state_{self.phone}")
+            if raw:
+                return json.loads(raw)
+        except Exception:
+            pass
+        return None
+
+    async def save_auth_state(self, state: Dict):
+        """Save auth state to database (survives restart)"""
+        try:
+            await self.db.set_setting(f"auth_state_{self.phone}", json.dumps(state))
+        except Exception as e:
+            logger.error(f"Failed to save auth state: {e}")
+
+    async def clear_auth_state(self):
+        """Clear auth state after successful login"""
+        try:
+            await self.db.set_setting(f"auth_state_{self.phone}", "")
+        except Exception:
+            pass
+
+    # ---- Client Lifecycle ----
+
+    def _make_client(self, session_str: str = None) -> TelegramClient:
+        """Create TelegramClient from session string"""
+        s = session_str or self.session_string
+        session = StringSession(s) if s else StringSession()
+        return TelegramClient(session, self.api_id, self.api_hash)
+
+    async def create_client(self) -> bool:
+        """Connect existing authorized client"""
+        try:
+            self.client = self._make_client()
             await self.client.connect()
 
             if not await self.client.is_user_authorized():
@@ -84,7 +119,7 @@ class AccountSession:
             self.me_id = me.id
             self.is_active = True
 
-            # Save session string to database for persistence across restarts
+            # Save final session
             self.session_string = self.client.session.save()
             await self.db.update_account(
                 self.phone,
@@ -93,7 +128,7 @@ class AccountSession:
                 last_error=None
             )
 
-            logger.info(f"Account {self.phone} connected successfully (ID: {self.me_id})")
+            logger.info(f"Account {self.phone} connected (ID: {self.me_id})")
             return True
 
         except Exception as e:
@@ -102,81 +137,7 @@ class AccountSession:
             await self.db.update_account(self.phone, last_error=str(e)[:200], is_active=0)
             return False
 
-    async def send_code(self) -> Tuple[bool, str]:
-        """Send verification code. Keeps client ALIVE in memory."""
-        try:
-            session = StringSession(self.session_string) if self.session_string else StringSession()
-            self.client = TelegramClient(session, self.api_id, self.api_hash)
-            await self.client.connect()
-
-            await self.client.send_code_request(self.phone)
-            logger.info(f"Code sent to {self.phone}")
-            return True, "sent"
-
-        except Exception as e:
-            logger.error(f"Failed to send code to {self.phone}: {e}")
-            return False, str(e)
-
-    async def sign_in(self, code: str) -> Tuple[bool, str]:
-        """Sign in with code. REQUIRES same client from send_code to be alive!"""
-        try:
-            # Use SAME client - phone_code_hash is stored internally by Telethon
-            await self.client.sign_in(self.phone, code)
-
-            me = await self.client.get_me()
-            self.me_id = me.id
-            self.is_active = True
-
-            # Save final session string for future reconnects
-            self.session_string = self.client.session.save()
-            await self.db.update_account(
-                self.phone,
-                session_string=self.session_string,
-                is_active=1,
-                last_error=None
-            )
-
-            return True, "Successfully signed in"
-
-        except SessionPasswordNeededError:
-            return False, "2FA_REQUIRED"
-        except PhoneCodeInvalidError:
-            return False, "Invalid code"
-        except Exception as e:
-            return False, str(e)
-
-    async def sign_in_2fa(self, password: str, session_string: str = None) -> Tuple[bool, str]:
-        """Sign in with 2FA password - saves StringSession to database"""
-        try:
-            # If session_string provided, create new client
-            if session_string:
-                session = StringSession(session_string)
-                self.client = TelegramClient(session, self.api_id, self.api_hash)
-                await self.client.connect()
-
-            await self.client.sign_in(password=password)
-            me = await self.client.get_me()
-            self.me_id = me.id
-            self.is_active = True
-
-            # Save session string to database
-            self.session_string = self.client.session.save()
-            await self.db.update_account(
-                self.phone,
-                session_string=self.session_string,
-                is_active=1,
-                last_error=None
-            )
-
-            return True, "Successfully signed in with 2FA"
-
-        except PasswordHashInvalidError:
-            return False, "Invalid password"
-        except Exception as e:
-            return False, str(e)
-
     async def disconnect(self):
-        """Disconnect client"""
         if self.client:
             try:
                 await self.client.disconnect()
@@ -185,8 +146,137 @@ class AccountSession:
         self.is_active = False
         await self.db.update_account(self.phone, is_active=0)
 
+    # ---- Auth Flow (using RAW API - survives restart) ----
+
+    async def send_code(self) -> Tuple[bool, str, str]:
+        """Send verification code using RAW API.
+        Returns: (success, phone_code_hash, session_string)"""
+        try:
+            # Fresh client with empty session
+            self.client = self._make_client(None)
+            await self.client.connect()
+
+            # Send code using RAW API (not the convenience method)
+            result = await self.client(SendCodeRequest(
+                phone_number=self.phone,
+                api_id=self.api_id,
+                api_hash=self.api_hash,
+                settings=types.CodeSettings(allow_flashcall=False, current_number=False, allow_app_hash=False)
+            ))
+
+            phone_code_hash = result.phone_code_hash
+            session_string = self.client.session.save()
+
+            # Save to DB so it survives restart!
+            await self.save_auth_state({
+                'phone_code_hash': phone_code_hash,
+                'session_string': session_string,
+                'created_at': time.time()
+            })
+
+            logger.info(f"Code sent to {self.phone}, hash stored in DB")
+            return True, phone_code_hash, session_string
+
+        except Exception as e:
+            logger.error(f"Failed to send code to {self.phone}: {e}")
+            return False, str(e), ""
+
+    async def sign_in(self, code: str, phone_code_hash: str = None,
+                      session_string: str = None) -> Tuple[bool, str]:
+        """Sign in using RAW API with explicit phone_code_hash.
+        This recreates client from session_string and passes hash explicitly."""
+        try:
+            # Load from DB if not provided
+            if not phone_code_hash or not session_string:
+                state = await self.load_auth_state()
+                if not state:
+                    return False, "No auth state found. Please start over with /startacc"
+                phone_code_hash = state.get('phone_code_hash')
+                session_string = state.get('session_string')
+                if not phone_code_hash:
+                    return False, "Auth state incomplete. Please start over."
+
+            # Recreate client from saved session
+            self.client = self._make_client(session_string)
+            await self.client.connect()
+
+            # Sign in using RAW API with explicit hash!
+            result = await self.client(SignInRequest(
+                phone_number=self.phone,
+                phone_code_hash=phone_code_hash,
+                phone_code=code
+            ))
+
+            # Check if user is authorized
+            if result.user:
+                self.me_id = result.user.id
+                self.is_active = True
+
+                # Save final session
+                self.session_string = self.client.session.save()
+                await self.db.update_account(
+                    self.phone,
+                    session_string=self.session_string,
+                    is_active=1,
+                    last_error=None
+                )
+                await self.clear_auth_state()
+                return True, "Successfully signed in"
+
+            return False, "Unknown response from server"
+
+        except SessionPasswordNeededError:
+            # Save session for 2FA step
+            self.session_string = self.client.session.save()
+            await self.save_auth_state({
+                'phone_code_hash': phone_code_hash,
+                'session_string': self.session_string,
+                'needs_2fa': True
+            })
+            return False, "2FA_REQUIRED"
+        except PhoneCodeInvalidError:
+            return False, "Invalid code"
+        except PhoneCodeExpiredError:
+            return False, "Code expired - please start over with /startacc"
+        except Exception as e:
+            return False, str(e)
+
+    async def sign_in_2fa(self, password: str) -> Tuple[bool, str]:
+        """Complete 2FA sign in"""
+        try:
+            if not self.client:
+                # Try to load from saved state
+                state = await self.load_auth_state()
+                if state and state.get('session_string'):
+                    self.client = self._make_client(state['session_string'])
+                    await self.client.connect()
+                else:
+                    return False, "Session lost. Please start over."
+
+            await self.client.sign_in(password=password)
+
+            me = await self.client.get_me()
+            self.me_id = me.id
+            self.is_active = True
+
+            self.session_string = self.client.session.save()
+            await self.db.update_account(
+                self.phone,
+                session_string=self.session_string,
+                is_active=1,
+                last_error=None
+            )
+            await self.clear_auth_state()
+            return True, "Successfully signed in with 2FA"
+
+        except PasswordHashInvalidError:
+            return False, "Invalid password"
+        except Exception as e:
+            return False, str(e)
+
+    # ---- Operations ----
+
     async def join_group(self, group_link: str) -> Tuple[bool, str]:
-        """Join a group"""
         try:
             entity = await self.client.get_entity(group_link)
             await self.client(JoinChannelRequest(entity))
@@ -200,7 +290,6 @@ class AccountSession:
 
     async def forward_message(self, from_chat_id: int, message_id: int,
                              target_id: int) -> bool:
-        """Forward message to target"""
         try:
             await self.client.forward_messages(target_id, message_id, from_chat_id)
             self.forward_count += 1
@@ -212,7 +301,6 @@ class AccountSession:
             return False
 
     async def send_message(self, user_id: int, text: str) -> Optional[Any]:
-        """Send message to user"""
         try:
             msg = await self.client.send_message(user_id, text)
             self.reply_count += 1
@@ -234,13 +322,6 @@ class AccountSession:
             logger.debug(f"Send error: {e}")
             return None
 
-    async def get_entity_safe(self, entity_id):
-        """Safely get entity"""
-        try:
-            return await self.client.get_entity(entity_id)
-        except Exception:
-            return None
-
 
 # ============== Message Dispatcher ==============
 
@@ -251,16 +332,10 @@ class MessageDispatcher:
         self.db = db
         self.config = config
         self.accounts: Dict[str, AccountSession] = {}
-
-        # Processing queues
         self.forward_queue: asyncio.Queue = asyncio.Queue(maxsize=config.QUEUE_SIZE)
         self.reply_queue: asyncio.Queue = asyncio.Queue(maxsize=config.QUEUE_SIZE)
-
-        # Deduplication
         self._processed_ids: Set[str] = set()
         self._processed_timestamps: deque = deque(maxlen=100000)
-
-        # Workers
         self._forward_workers: List[asyncio.Task] = []
         self._reply_workers: List[asyncio.Task] = []
         self._running = False
@@ -280,77 +355,40 @@ class MessageDispatcher:
         self._admin_cache = Cache(ttl=300)
 
     async def initialize(self):
-        """Load runtime data from database"""
         await self.reload_data()
-
         self._running = True
-
-        # Start worker pools
         for i in range(self.config.WORKERS):
-            self._forward_workers.append(
-                asyncio.create_task(self._forward_worker(i))
-            )
-            self._reply_workers.append(
-                asyncio.create_task(self._reply_worker(i))
-            )
-
-        # Cleanup task
+            self._forward_workers.append(asyncio.create_task(self._forward_worker(i)))
+            self._reply_workers.append(asyncio.create_task(self._reply_worker(i)))
         asyncio.create_task(self._cleanup_old_ids())
-
         logger.info(f"Dispatcher initialized with {self.config.WORKERS} workers")
 
     async def shutdown(self):
-        """Graceful shutdown"""
         self._running = False
-
-        # Cancel workers
         for task in self._forward_workers + self._reply_workers:
             task.cancel()
-
-        # Drain queues
-        while not self.forward_queue.empty():
-            try:
-                self.forward_queue.get_nowait()
-                self.forward_queue.task_done()
-            except Exception:
-                break
-
-        while not self.reply_queue.empty():
-            try:
-                self.reply_queue.get_nowait()
-                self.reply_queue.task_done()
-            except Exception:
-                break
-
         logger.info("Dispatcher shutdown complete")
 
     async def reload_data(self):
-        """Reload all runtime data from database"""
         self.keywords = await self.db.get_keywords()
         self.triggers = await self.db.get_triggers()
         self.auto_replies = await self.db.get_auto_replies()
         self.blocked_phrases = await self.db.get_blocked_phrases()
         self.blocked_users = await self.db.get_blocked_users()
         self.excluded_groups = {g['group_id'] for g in await self.db.get_groups(excluded=True)}
-
         self.config.compile_keywords(self.keywords)
         self._keyword_regex = self.config.KEYWORDS_REGEX
-
         logger.info(f"Loaded {len(self.keywords)} keywords, {len(self.triggers)} triggers, "
                    f"{len(self.auto_replies)} auto-replies, {len(self.blocked_users)} blocked users")
 
     def register_account(self, account: AccountSession):
-        """Register an account for use"""
         self.accounts[account.phone] = account
 
     def unregister_account(self, phone: str):
-        """Unregister an account"""
         self.accounts.pop(phone, None)
 
     async def process_message(self, event: events.NewMessage.Event):
-        """Process incoming message"""
         start_time = time.time()
-
         try:
             if not self.accounts or not self._running:
                 return
@@ -360,7 +398,6 @@ class MessageDispatcher:
             text = event.message.message or ""
             sender_id = event.message.sender_id
 
-            # Quick checks
             if chat_id in self.excluded_groups:
                 return
 
@@ -374,22 +411,18 @@ class MessageDispatcher:
             if TextProcessor.should_skip(text):
                 return
 
-            # Deduplication
             msg_id = f"{chat_id}:{message_id}:{sender_id}"
             if msg_id in self._processed_ids:
                 return
             self._processed_ids.add(msg_id)
             self._processed_timestamps.append((msg_id, time.time()))
 
-            # Keyword matching
             keyword_match = TextProcessor.keyword_match(text, self._keyword_regex)
-
             if not keyword_match:
                 return
 
             self.metrics.increment('messages_matched')
 
-            # Get info
             username = getattr(sender, 'username', '') or '' if sender else ''
             display_name = ''
             if sender:
@@ -398,36 +431,20 @@ class MessageDispatcher:
             chat = event.chat
             chat_title = getattr(chat, 'title', '') or '' if chat else ''
 
-            # Forward
             await self.forward_queue.put({
-                'event': event,
-                'chat_id': chat_id,
-                'message_id': message_id,
-                'text': text,
-                'sender_id': sender_id,
-                'username': username,
-                'display_name': display_name,
-                'chat_title': chat_title,
+                'event': event, 'chat_id': chat_id, 'message_id': message_id,
+                'text': text, 'sender_id': sender_id, 'username': username,
+                'display_name': display_name, 'chat_title': chat_title,
             })
 
-            # Check trigger for auto-reply
             if TextProcessor.fuzzy_match(text, self.triggers):
                 normalized = TextProcessor.normalize(text)
-                blocked = any(
-                    TextProcessor.normalize(phrase) in normalized
-                    for phrase in self.blocked_phrases
-                )
-
+                blocked = any(TextProcessor.normalize(phrase) in normalized for phrase in self.blocked_phrases)
                 if not blocked:
                     await self.reply_queue.put({
-                        'event': event,
-                        'chat_id': chat_id,
-                        'message_id': message_id,
-                        'text': text,
-                        'sender_id': sender_id,
-                        'username': username,
-                        'display_name': display_name,
-                        'chat_title': chat_title,
+                        'event': event, 'chat_id': chat_id, 'message_id': message_id,
+                        'text': text, 'sender_id': sender_id, 'username': username,
+                        'display_name': display_name, 'chat_title': chat_title,
                     })
 
             elapsed = time.time() - start_time
@@ -438,7 +455,6 @@ class MessageDispatcher:
             logger.error(f"Error processing message: {e}")
 
     async def _forward_worker(self, worker_id: int):
-        """Forward worker"""
         logger.info(f"Forward worker {worker_id} started")
         while self._running:
             try:
@@ -455,7 +471,6 @@ class MessageDispatcher:
                     pass
 
     async def _reply_worker(self, worker_id: int):
-        """Reply worker"""
         logger.info(f"Reply worker {worker_id} started")
         while self._running:
             try:
@@ -472,121 +487,74 @@ class MessageDispatcher:
                     pass
 
     async def _do_forward(self, data: dict):
-        """Execute forward"""
         try:
             tasks = []
             for phone, account in self.accounts.items():
-                if not account.is_active:
-                    continue
-                if account.mode not in ('forward', 'both'):
+                if not account.is_active or account.mode not in ('forward', 'both'):
                     continue
                 if account.target_group_id and account.target_group_id != 0:
-                    tasks.append(self._forward_single(
-                        account, data['chat_id'], data['message_id'],
-                        account.target_group_id, data
-                    ))
-
+                    tasks.append(self._forward_single(account, data['chat_id'], data['message_id'], account.target_group_id, data))
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 self.metrics.increment('forwards_sent', len(tasks))
-
         except Exception as e:
             logger.error(f"Forward error: {e}")
 
     async def _forward_single(self, account: AccountSession, from_chat: int,
                               message_id: int, target_id: int, data: dict):
-        """Forward single message"""
         try:
             success = await account.forward_message(from_chat, message_id, target_id)
             if success:
                 await self.db.log_forward(from_chat, message_id, target_id, account.phone)
         except FloodWaitError as e:
-            logger.warning(f"Flood wait for {account.phone}: {e.seconds}s")
             await asyncio.sleep(min(e.seconds, 30))
-        except Exception as e:
-            logger.debug(f"Forward single error: {e}")
+        except Exception:
+            pass
 
     async def _do_reply(self, data: dict):
-        """Execute auto-reply"""
         try:
             sender_id = data['sender_id']
-
             if not self.rate_limiter.is_allowed(sender_id):
                 return
 
-            recent_count = await self.db.get_reply_count(
-                sender_id, self.config.AUTO_BLOCK_HOURS
-            )
-
-            # Auto-block
+            recent_count = await self.db.get_reply_count(sender_id, self.config.AUTO_BLOCK_HOURS)
             if recent_count >= self.config.AUTO_BLOCK_THRESHOLD:
-                await self.db.block_user(
-                    sender_id,
-                    data.get('username'),
-                    data.get('display_name'),
-                    f"Auto-blocked after {recent_count} replies",
-                    auto_blocked=True
-                )
-                self.blocked_users[sender_id] = {
-                    'user_id': sender_id,
-                    'username': data.get('username'),
-                    'display_name': data.get('display_name')
-                }
-                logger.info(f"Auto-blocked user {sender_id}")
+                await self.db.block_user(sender_id, data.get('username'), data.get('display_name'),
+                                        f"Auto-blocked after {recent_count} replies", auto_blocked=True)
+                self.blocked_users[sender_id] = {'user_id': sender_id, 'username': data.get('username'),
+                                                  'display_name': data.get('display_name')}
                 return
 
-            # Find reply account
             reply_account = None
             for phone, account in self.accounts.items():
-                if not account.is_active:
-                    continue
-                if account.mode not in ('reply', 'both'):
-                    continue
-                reply_account = account
-                break
-
+                if account.is_active and account.mode in ('reply', 'both'):
+                    reply_account = account
+                    break
             if not reply_account:
                 return
 
-            # Send original text as DM
-            original_text = data['text']
-            msg1 = await reply_account.send_message(sender_id, original_text)
-
+            msg1 = await reply_account.send_message(sender_id, data['text'])
             if msg1:
-                # Send auto-reply
-                await asyncio.sleep(0.5)  # Small delay between messages
+                await asyncio.sleep(0.5)
                 reply_text = self._get_next_auto_reply()
                 msg2 = await reply_account.send_message(sender_id, reply_text)
-
                 if msg2:
                     self.rate_limiter.add_request(sender_id)
                     self.metrics.increment('replies_sent')
-
-                    await self.db.log_reply(
-                        sender_id,
-                        data.get('username'),
-                        data.get('display_name'),
-                        reply_account.phone,
-                        msg2.id if msg2 else None,
-                        data['chat_id'],
-                        data.get('chat_title'),
-                        ''
-                    )
-
+                    await self.db.log_reply(sender_id, data.get('username'), data.get('display_name'),
+                                           reply_account.phone, msg2.id if msg2 else None,
+                                           data['chat_id'], data.get('chat_title'), '')
         except Exception as e:
             logger.error(f"Reply error: {e}")
 
     def _get_next_auto_reply(self) -> str:
-        """Get next auto-reply message"""
         if not self.auto_replies:
             return "مرحباً! 👋\n\nأنا هنا لمساعدتك 📚✨\n\nارسل التفاصيل و راح أساعدك إن شاء الله 😊"
-
         msg = self.auto_replies[self._auto_reply_index]
         self._auto_reply_index = (self._auto_reply_index + 1) % len(self.auto_replies)
         return msg
 
     async def _cleanup_old_ids(self):
-        """Periodically clean old processed IDs"""
         while self._running:
             await asyncio.sleep(600)
             cutoff = time.time() - 1800
@@ -596,12 +564,9 @@ class MessageDispatcher:
                     to_remove.append(msg_id)
             for msg_id in to_remove:
                 self._processed_ids.discard(msg_id)
-
             self._admin_cache.cleanup()
-            logger.debug(f"Cleaned {len(to_remove)} old message IDs")
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get dispatcher statistics"""
         stats = self.metrics.get_stats()
         stats['forward_queue_size'] = self.forward_queue.qsize()
         stats['reply_queue_size'] = self.reply_queue.qsize()
@@ -623,70 +588,46 @@ class ControlBot:
         self.db = db
         self.dispatcher = dispatcher
         self.config = config
-
         self.client: Optional[TelegramClient] = None
         self.owner_id: int = config.OWNER_ID
-        self._pending_codes: Dict[str, dict] = {}
         self._pending_2fa: Dict[str, dict] = {}
         self._pending_ops: Dict[int, dict] = {}
 
     async def start(self):
-        """Start the control bot"""
         try:
-            self.client = TelegramClient(
-                StringSession(),
-                self.api_id,
-                self.api_hash
-            )
+            self.client = TelegramClient(StringSession(), self.api_id, self.api_hash)
             await self.client.start(bot_token=self.token)
-
             me = await self.client.get_me()
             logger.info(f"Control bot started: @{me.username}")
-
             self._setup_handlers()
-
             await self.client.run_until_disconnected()
-
         except Exception as e:
             logger.error(f"Control bot error: {e}")
-            raise
 
     def _setup_handlers(self):
-        """Setup message handlers"""
-
         @self.client.on(events.NewMessage)
         async def handler(event):
             await self._handle_message(event)
 
     async def _handle_message(self, event: events.NewMessage.Event):
-        """Handle incoming message"""
         try:
             if not event.is_private:
                 return
-
             sender_id = event.sender_id
             text = event.message.message or ""
-
-            # Check owner
             if sender_id != self.owner_id and self.owner_id != 0:
                 if text.startswith('/'):
                     await event.reply("⚠️ أنت غير مصرح لك باستخدام هذا البوت.")
                 return
-
-            # Handle pending operations
             if sender_id in self._pending_ops:
                 await self._handle_pending_op(sender_id, text, event)
                 return
-
-            # Handle commands
             if text.startswith('/'):
                 await self._handle_command(event)
-
         except Exception as e:
             logger.error(f"Message handler error: {e}")
 
     async def _handle_command(self, event: events.NewMessage.Event):
-        """Handle bot commands"""
         text = event.message.message or ""
         parts = text.split()
         command = parts[0].lower()
@@ -717,7 +658,6 @@ class ControlBot:
             '/blockuser': self._cmd_block_user,
             '/unblockuser': self._cmd_unblock_user,
             '/addgroup': self._cmd_add_group,
-            '/delgroup': self._cmd_del_group,
             '/groups': self._cmd_list_groups,
             '/setfallback': self._cmd_set_fallback,
             '/joingroup': self._cmd_join_group,
@@ -759,40 +699,27 @@ class ControlBot:
             "**إدارة الحسابات:**\n"
             "• `/addaccount` - إضافة حساب جديد\n"
             "• `/accounts` - عرض الحسابات\n"
-            "• `/startacc <phone>` - تشغيل حساب\n"
+            "• `/startacc <phone>` - تشغيل/توثيق حساب\n"
             "• `/stopacc <phone>` - إيقاف حساب\n"
             "• `/delacc <phone>` - حذف حساب\n"
             "• `/setmode <phone> <forward/reply/both/self>`\n"
             "• `/settarget <phone> <group_id>`\n\n"
-            "**إدارة الكلمات المفتاحية:**\n"
-            "• `/addkeyword <word>`\n"
-            "• `/delkeyword <word>`\n"
-            "• `/keywords`\n\n"
-            "**إدارة المحفزات:**\n"
-            "• `/addtrigger <phrase>`\n"
-            "• `/deltrigger <phrase>`\n"
-            "• `/triggers`\n\n"
-            "**إدارة الردود التلقائية:**\n"
-            "• `/addreply <message>`\n"
-            "• `/delreply <message>`\n"
-            "• `/replies`\n\n"
+            "**إدارة الكلمات والردود:**\n"
+            "• `/keywords` - عرض الكلمات المفتاحية\n"
+            "• `/addkeyword <word>` - إضافة كلمة\n"
+            "• `/triggers` - عرض المحفزات\n"
+            "• `/replies` - عرض الردود التلقائية\n"
+            "• `/addreply <message>` - إضافة رد\n\n"
             "**الحظر والحماية:**\n"
+            "• `/blocked` - عرض المحظورين\n"
             "• `/blockuser <user_id>`\n"
-            "• `/unblockuser <user_id>`\n"
-            "• `/blocked`\n"
             "• `/setthreshold <number>`\n\n"
-            "**إدارة الجروبات:**\n"
-            "• `/addgroup <group_id> [title]`\n"
-            "• `/groups`\n"
-            "• `/setfallback <group_id>`\n"
-            "• `/joingroup <phone> <link>`\n\n"
             "**أدوات:**\n"
             "• `/stats` - الإحصائيات\n"
             "• `/metrics` - مقاييس الأداء\n"
             "• `/reload` - إعادة تحميل\n"
-            "• `/backup` - نسخ احتياطي\n"
-            "• `/broadcast <msg>` - إذاعة\n\n"
-            "• `/cancel` - إلغاء العملية الحالية"
+            "• `/backup` - نسخة احتياطية\n"
+            "• `/cancel` - إلغاء العملية"
         )
         await event.reply(help_text)
 
@@ -806,29 +733,18 @@ class ControlBot:
 
     async def _cmd_add_account(self, event, args):
         self._pending_ops[event.sender_id] = {'op': 'add_account', 'step': 1, 'data': {}}
-        await event.reply(
-            "🆕 **إضافة حساب جديد**\n\n"
-            "الخطوة 1/4: أرسل API ID الخاص بالحساب:\n\n"
-            "(أرسل /cancel للإلغاء)"
-        )
+        await event.reply("🆕 **إضافة حساب جديد**\n\nالخطوة 1/4: أرسل API ID:\n(أرسل /cancel للإلغاء)")
 
     async def _cmd_list_accounts(self, event, args):
         accounts = await self.db.get_all_accounts()
         if not accounts:
             await event.reply("📭 لا توجد حسابات مسجلة.")
             return
-
         lines = ["📱 **الحسابات المسجلة:**\n"]
         for acc in accounts:
             status = "🟢" if acc['is_active'] else "🔴"
-            mode = acc['mode']
-            enabled = "✅" if acc['enabled'] else "❌"
-            session_status = "📲 جلسة" if acc.get('session_string') else "❌ لا جلسة"
-            lines.append(
-                f"{status} `{acc['phone']}` | Mode: `{mode}` | {enabled}\n"
-                f"   {session_status} | 📤 {acc['forward_count']} | 💬 {acc['reply_count']}"
-            )
-
+            session_ok = "📲 جلسة" if acc.get('session_string') else "❌ لا جلسة"
+            lines.append(f"{status} `{acc['phone']}` | `{acc['mode']}` | {session_ok} | 📤 {acc['forward_count']}")
         await event.reply("\n".join(lines[:50]))
 
     async def _cmd_start_account(self, event, args):
@@ -838,7 +754,6 @@ class ControlBot:
 
         phone = format_phone(args[0])
         account_data = await self.db.get_account(phone)
-
         if not account_data:
             await event.reply(f"❌ الحساب `{phone}` غير موجود. أضفه أولاً بـ `/addaccount`")
             return
@@ -858,32 +773,24 @@ class ControlBot:
             session_string=account_data.get('session_string')
         )
 
-        # Try to connect
+        # Try existing session first
         success = await account.create_client()
-
         if success:
             self.dispatcher.register_account(account)
             await self.db.update_account(phone, is_active=1, enabled=1)
             await event.reply(f"✅ تم تشغيل الحساب `{phone}` بنجاح!")
+            return
+
+        # Need authentication - send code using RAW API
+        success, msg, session_str = await account.send_code()
+        if success:
+            await event.reply(
+                f"📩 تم إرسال كود التحقق إلى `{phone}`.\n"
+                f"أرسل الكود الآن: `/verify {phone} 12345`\n\n"
+                f"⚡ **اكتب الكود فوراً!** صالح لدقيقتين."
+            )
         else:
-            # Need authentication - send code
-            success, result = await account.send_code()
-            if success:
-                # CRITICAL: Store the ALIVE client in memory
-                # phone_code_hash is stored INSIDE the Telethon client object
-                # We MUST use the exact same client object for sign_in!
-                self._pending_codes[phone] = {
-                    'client': account.client,  # SAME client - alive in memory
-                    'account': account,
-                }
-                await event.reply(
-                    f"📩 تم إرسال كود التحقق إلى `{phone}`.\n"
-                    f"أرسل الكود الآن: `/verify {phone} 12345`\n\n"
-                    f"⚡ **اكتب الكود بسرعة!**\n"
-                    f"الكود صالح لدقيقتين."
-                )
-            else:
-                await event.reply(f"❌ فشل إرسال الكود: `{result}`")
+            await event.reply(f"❌ فشل إرسال الكود: `{msg}`")
 
     async def _cmd_verify(self, event, args):
         if len(args) < 2:
@@ -893,39 +800,37 @@ class ControlBot:
         phone = format_phone(args[0])
         code = args[1]
 
-        if phone not in self._pending_codes:
-            await event.reply("⚠️ لا يوجد طلب تحقق معلق لهذا الرقم. استخدم `/startacc <phone>` أولاً.")
+        # Get account from DB
+        account_data = await self.db.get_account(phone)
+        if not account_data:
+            await event.reply(f"❌ الحساب `{phone}` غير موجود.")
             return
 
-        pending = self._pending_codes[phone]
-        account = pending['account']
+        # Create account object
+        account = AccountSession(
+            phone=phone,
+            api_id=account_data['api_id'],
+            api_hash=account_data['api_hash'],
+            target_group_id=account_data.get('target_group_id', 0),
+            mode=account_data.get('mode', 'both'),
+            db=self.db,
+            session_string=account_data.get('session_string')
+        )
 
-        # CRITICAL: Use the SAME client from send_code!
-        # phone_code_hash lives INSIDE the Telethon client object.
-        # Creating a new client loses the hash - that's why it kept expiring.
-        account.client = pending['client']
-
-        # Ensure client is still connected
-        if not account.client.is_connected():
-            logger.warning("Client disconnected, reconnecting...")
-            await account.client.connect()
-
+        # Sign in using RAW API - state loaded from DB automatically
         success, result = await account.sign_in(code)
 
         if success:
             self.dispatcher.register_account(account)
             await self.db.update_account(phone, is_active=1, enabled=1)
-            del self._pending_codes[phone]
             await event.reply(f"✅ تم توثيق وتشغيل الحساب `{phone}` بنجاح!")
         elif result == "2FA_REQUIRED":
-            self._pending_2fa[phone] = {'account': account, 'client': account.client}
-            del self._pending_codes[phone]
+            self._pending_2fa[phone] = {'account': account}
             await event.reply(
                 f"🔐 الحساب `{phone}` يتطلب 2FA.\n"
-                f"أرسل كلمة المرور: `/verify2fa {phone} <password>`"
+                f"أرسل: `/verify2fa {phone} <password>`"
             )
         else:
-            del self._pending_codes[phone]
             await event.reply(
                 f"❌ فشل التوثيق: `{result}`\n\n"
                 f"💡 أعد المحاولة بـ `/startacc {phone}`"
@@ -943,15 +848,7 @@ class ControlBot:
             await event.reply("⚠️ لا يوجد طلب 2FA معلق.")
             return
 
-        pending = self._pending_2fa[phone]
-        account = pending['account']
-
-        # Use SAME client from verify step
-        account.client = pending['client']
-
-        if not account.client.is_connected():
-            await account.client.connect()
-
+        account = self._pending_2fa[phone]['account']
         success, result = await account.sign_in_2fa(password)
 
         if success:
@@ -960,18 +857,13 @@ class ControlBot:
             del self._pending_2fa[phone]
             await event.reply(f"✅ تم توثيق الحساب `{phone}` بنجاح مع 2FA!")
         else:
-            await event.reply(
-                f"❌ فشل التوثيق: `{result}`\n\n"
-                f"💡 تأكد من صحة كلمة المرور ثنائية العوامل وأعد المحاولة."
-            )
+            await event.reply(f"❌ فشل: `{result}`")
 
     async def _cmd_stop_account(self, event, args):
         if not args:
             await event.reply("⚠️ استخدم: `/stopacc <phone>`")
             return
-
         phone = format_phone(args[0])
-
         for p, acc in list(self.dispatcher.accounts.items()):
             if p == phone:
                 await acc.disconnect()
@@ -979,141 +871,114 @@ class ControlBot:
                 await self.db.update_account(phone, is_active=0, enabled=0)
                 await event.reply(f"⏹️ تم إيقاف الحساب `{phone}`.")
                 return
-
         await event.reply(f"⚠️ الحساب `{phone}` غير نشط.")
 
     async def _cmd_delete_account(self, event, args):
         if not args:
             await event.reply("⚠️ استخدم: `/delacc <phone>`")
             return
-
         phone = format_phone(args[0])
-
-        # Stop if active
         for p, acc in list(self.dispatcher.accounts.items()):
             if p == phone:
                 await acc.disconnect()
                 self.dispatcher.unregister_account(phone)
                 break
-
         success = await self.db.delete_account(phone)
         if success:
             await event.reply(f"🗑️ تم حذف الحساب `{phone}`.")
         else:
-            await event.reply(f"❌ فشل حذف الحساب `{phone}`.")
+            await event.reply(f"❌ فشل الحذف.")
 
     async def _cmd_set_mode(self, event, args):
         if len(args) < 2:
-            await event.reply("⚠️ استخدم: `/setmode <phone> <forward/reply/both/self>`")
+            await event.reply("⚠️ استخدم: `/setmode <phone> <mode>`")
             return
-
         phone = format_phone(args[0])
         mode = args[1].lower()
-
         if mode not in self.config.VALID_MODES:
-            await event.reply(f"❌ الوضع غير صالح. المتاح: {', '.join(self.config.VALID_MODES)}")
+            await event.reply(f"❌ المتاح: {', '.join(self.config.VALID_MODES)}")
             return
-
         success = await self.db.update_account(phone, mode=mode)
         if success:
             if phone in self.dispatcher.accounts:
                 self.dispatcher.accounts[phone].mode = mode
-            await event.reply(f"✅ تم تعيين وضع `{phone}` إلى `{mode}`.")
+            await event.reply(f"✅ وضع `{phone}` ← `{mode}`")
             await self.dispatcher.reload_data()
         else:
-            await event.reply("❌ فشل تحديث الوضع.")
+            await event.reply("❌ فشل.")
 
     async def _cmd_set_target(self, event, args):
         if len(args) < 2:
             await event.reply("⚠️ استخدم: `/settarget <phone> <group_id>`")
             return
-
         phone = format_phone(args[0])
         try:
             group_id = int(args[1])
         except ValueError:
-            await event.reply("❌ معرف المجموعة يجب أن يكون رقماً.")
+            await event.reply("❌ رقم غير صالح.")
             return
-
         success = await self.db.update_account(phone, target_group_id=group_id)
         if success:
             if phone in self.dispatcher.accounts:
                 self.dispatcher.accounts[phone].target_group_id = group_id
-            await event.reply(f"✅ تم تعيين مجموعة الهدف للحساب `{phone}` إلى `{group_id}`.")
+            await event.reply(f"✅ target `{phone}` ← `{group_id}`")
         else:
-            await event.reply("❌ فشل التحديث.")
+            await event.reply("❌ فشل.")
 
     async def _cmd_add_keyword(self, event, args):
         if not args:
             await event.reply("⚠️ استخدم: `/addkeyword <word>`")
             return
-
-        keyword = " ".join(args)
-        success = await self.db.add_keyword(keyword)
+        success = await self.db.add_keyword(" ".join(args))
         if success:
             await self.dispatcher.reload_data()
-            await event.reply(f"✅ تم إضافة الكلمة المفتاحية: `{keyword}`")
+            await event.reply("✅ تم الإضافة.")
         else:
-            await event.reply("⚠️ الكلمة موجودة مسبقاً أو حدث خطأ.")
+            await event.reply("⚠️ موجود مسبقاً.")
 
     async def _cmd_del_keyword(self, event, args):
         if not args:
             await event.reply("⚠️ استخدم: `/delkeyword <word>`")
             return
-
-        keyword = " ".join(args)
-        success = await self.db.delete_keyword(keyword)
+        success = await self.db.delete_keyword(" ".join(args))
         if success:
             await self.dispatcher.reload_data()
-            await event.reply(f"✅ تم حذف الكلمة المفتاحية: `{keyword}`")
+            await event.reply("✅ تم الحذف.")
         else:
-            await event.reply("❌ فشل الحذف.")
+            await event.reply("❌ فشل.")
 
     async def _cmd_list_keywords(self, event, args):
         keywords = await self.db.get_keywords()
         if not keywords:
-            await event.reply("📭 لا توجد كلمات مفتاحية.")
+            await event.reply("📭 لا توجد كلمات.")
             return
-
-        text = f"🔍 **الكلمات المفتاحية ({len(keywords)}):**\n\n"
+        text = f"🔍 **الكلمات ({len(keywords)}):**\n\n"
         text += "\n".join([f"• `{kw}`" for kw in keywords[:100]])
-        if len(keywords) > 100:
-            text += f"\n\n... و {len(keywords) - 100} كلمة أخرى"
-
         await event.reply(text)
 
     async def _cmd_add_trigger(self, event, args):
         if not args:
             await event.reply("⚠️ استخدم: `/addtrigger <phrase>`")
             return
-
-        trigger = " ".join(args)
-        success = await self.db.add_trigger(trigger)
+        success = await self.db.add_trigger(" ".join(args))
         if success:
             await self.dispatcher.reload_data()
-            await event.reply(f"✅ تم إضافة المحفز: `{trigger}`")
-        else:
-            await event.reply("⚠️ المحفز موجود مسبقاً.")
+            await event.reply("✅ تم الإضافة.")
 
     async def _cmd_del_trigger(self, event, args):
         if not args:
             await event.reply("⚠️ استخدم: `/deltrigger <phrase>`")
             return
-
-        trigger = " ".join(args)
-        success = await self.db.delete_trigger(trigger)
+        success = await self.db.delete_trigger(" ".join(args))
         if success:
             await self.dispatcher.reload_data()
-            await event.reply(f"✅ تم حذف المحفز: `{trigger}`")
-        else:
-            await event.reply("❌ فشل الحذف.")
+            await event.reply("✅ تم الحذف.")
 
     async def _cmd_list_triggers(self, event, args):
         triggers = await self.db.get_triggers()
         if not triggers:
             await event.reply("📭 لا توجد محفزات.")
             return
-
         text = f"⚡ **المحفزات ({len(triggers)}):**\n\n"
         text += "\n".join([f"• `{tr}`" for tr in triggers[:100]])
         await event.reply(text)
@@ -1122,191 +987,140 @@ class ControlBot:
         if not args:
             await event.reply("⚠️ استخدم: `/addreply <message>`")
             return
-
-        message = " ".join(args)
-        success = await self.db.add_auto_reply(message)
+        success = await self.db.add_auto_reply(" ".join(args))
         if success:
             await self.dispatcher.reload_data()
-            await event.reply("✅ تم إضافة رسالة الرد التلقائي.")
-        else:
-            await event.reply("⚠️ الرسالة موجودة مسبقاً.")
+            await event.reply("✅ تم الإضافة.")
 
     async def _cmd_del_reply(self, event, args):
         if not args:
             await event.reply("⚠️ استخدم: `/delreply <message>`")
             return
-
-        message = " ".join(args)
-        success = await self.db.delete_auto_reply(message)
+        success = await self.db.delete_auto_reply(" ".join(args))
         if success:
             await self.dispatcher.reload_data()
-            await event.reply("✅ تم حذف رسالة الرد التلقائي.")
-        else:
-            await event.reply("❌ فشل الحذف.")
+            await event.reply("✅ تم الحذف.")
 
     async def _cmd_list_replies(self, event, args):
         replies = await self.db.get_auto_replies()
         if not replies:
-            await event.reply("📭 لا توجد ردود تلقائية.")
+            await event.reply("📭 لا توجد ردود.")
             return
-
-        text = f"💬 **الردود التلقائية ({len(replies)}):**\n\n"
+        text = f"💬 **الردود ({len(replies)}):**\n\n"
         for i, reply in enumerate(replies[:20], 1):
             preview = reply[:50] + "..." if len(reply) > 50 else reply
             text += f"{i}. {preview}\n\n"
-
         await event.reply(text)
 
     async def _cmd_add_blocked(self, event, args):
         if not args:
             await event.reply("⚠️ استخدم: `/addblocked <phrase>`")
             return
-
-        phrase = " ".join(args)
-        success = await self.db.add_blocked_phrase(phrase)
+        success = await self.db.add_blocked_phrase(" ".join(args))
         if success:
             await self.dispatcher.reload_data()
-            await event.reply(f"✅ تم إضافة العبارة المحظورة: `{phrase}`")
-        else:
-            await event.reply("⚠️ العبارة موجودة مسبقاً.")
+            await event.reply("✅ تم الإضافة.")
 
     async def _cmd_del_blocked(self, event, args):
         if not args:
             await event.reply("⚠️ استخدم: `/delblocked <phrase>`")
             return
-
-        phrase = " ".join(args)
-        success = await self.db.delete_blocked_phrase(phrase)
+        success = await self.db.delete_blocked_phrase(" ".join(args))
         if success:
             await self.dispatcher.reload_data()
-            await event.reply("✅ تم حذف العبارة المحظورة.")
-        else:
-            await event.reply("❌ فشل الحذف.")
+            await event.reply("✅ تم الحذف.")
 
     async def _cmd_list_blocked(self, event, args):
         phrases = await self.db.get_blocked_phrases()
         users = await self.db.get_blocked_users()
-
         text = "🚫 **قائمة الحظر:**\n\n"
-
         if phrases:
-            text += f"**العبارات المحظورة ({len(phrases)}):**\n"
-            text += "\n".join([f"• `{p}`" for p in phrases[:50]])
-            text += "\n\n"
-
+            text += f"**العبارات ({len(phrases)}):**\n" + "\n".join([f"• `{p}`" for p in phrases[:50]]) + "\n\n"
         if users:
-            text += f"**المستخدمون المحظورون ({len(users)}):**\n"
+            text += f"**المستخدمون ({len(users)}):**\n"
             for uid, info in list(users.items())[:50]:
                 text += f"• `{uid}` - {info.get('display_name', 'N/A')}\n"
-
         if not phrases and not users:
             text += "📭 لا توجد عناصر محظورة."
-
         await event.reply(text)
 
     async def _cmd_block_user(self, event, args):
         if not args:
-            await event.reply("⚠️ استخدم: `/blockuser <user_id> [reason]`")
+            await event.reply("⚠️ استخدم: `/blockuser <user_id>`")
             return
-
         try:
             user_id = int(args[0])
         except ValueError:
-            await event.reply("❌ معرف المستخدم يجب أن يكون رقماً.")
+            await event.reply("❌ رقم غير صالح.")
             return
-
         reason = " ".join(args[1:]) if len(args) > 1 else None
         success = await self.db.block_user(user_id, reason=reason)
         if success:
             await self.dispatcher.reload_data()
-            await event.reply(f"✅ تم حظر المستخدم `{user_id}`.")
-        else:
-            await event.reply("❌ فشل الحظر.")
+            await event.reply("✅ تم الحظر.")
 
     async def _cmd_unblock_user(self, event, args):
         if not args:
             await event.reply("⚠️ استخدم: `/unblockuser <user_id>`")
             return
-
         try:
             user_id = int(args[0])
         except ValueError:
-            await event.reply("❌ معرف المستخدم يجب أن يكون رقماً.")
             return
-
         success = await self.db.unblock_user(user_id)
         if success:
             await self.dispatcher.reload_data()
-            await event.reply(f"✅ تم إلغاء حظر المستخدم `{user_id}`.")
-        else:
-            await event.reply("❌ فشل إلغاء الحظر.")
+            await event.reply("✅ تم إلغاء الحظر.")
 
     async def _cmd_add_group(self, event, args):
         if not args:
             await event.reply("⚠️ استخدم: `/addgroup <group_id> [title]`")
             return
-
         try:
             group_id = int(args[0])
         except ValueError:
-            await event.reply("❌ معرف المجموعة يجب أن يكون رقماً.")
+            await event.reply("❌ رقم غير صالح.")
             return
-
         title = " ".join(args[1:]) if len(args) > 1 else None
         success = await self.db.add_group(group_id, title=title)
         if success:
-            await event.reply(f"✅ تم إضافة المجموعة `{group_id}`.")
-        else:
-            await event.reply("❌ فشل الإضافة.")
-
-    async def _cmd_del_group(self, event, args):
-        await event.reply("⚠️ لحذف مجموعة، أضفها للمستبعدات بـ `/setexcluded <group_id>`")
+            await event.reply("✅ تم الإضافة.")
 
     async def _cmd_list_groups(self, event, args):
         groups = await self.db.get_groups()
         if not groups:
-            await event.reply("📭 لا توجد مجموعات مسجلة.")
+            await event.reply("📭 لا توجد مجموعات.")
             return
-
         text = f"📋 **المجموعات ({len(groups)}):**\n\n"
         for g in groups[:50]:
             text += f"• `{g['group_id']}` - {g.get('title', 'N/A')}\n"
-
         await event.reply(text)
 
     async def _cmd_set_fallback(self, event, args):
         if not args:
             await event.reply("⚠️ استخدم: `/setfallback <group_id>`")
             return
-
         try:
             group_id = int(args[0])
         except ValueError:
-            await event.reply("❌ معرف المجموعة يجب أن يكون رقماً.")
+            await event.reply("❌ رقم غير صالح.")
             return
-
         success = await self.db.add_group(group_id, is_fallback=True)
         if success:
             await self.db.set_setting('fallback_group_id', str(group_id))
-            await event.reply(f"✅ تم تعيين مجموعة الاحتياط إلى `{group_id}`.")
-        else:
-            await event.reply("❌ فشل التعيين.")
+            await event.reply(f"✅ fallback ← `{group_id}`")
 
     async def _cmd_join_group(self, event, args):
         if len(args) < 2:
-            await event.reply("⚠️ استخدم: `/joingroup <phone> <group_link>`")
+            await event.reply("⚠️ استخدم: `/joingroup <phone> <link>`")
             return
-
         phone = format_phone(args[0])
         group_link = args[1]
-
         if phone not in self.dispatcher.accounts:
-            await event.reply(f"❌ الحساب `{phone}` غير نشط. شغله أولاً بـ `/startacc {phone}`")
+            await event.reply(f"❌ الحساب `{phone}` غير نشط.")
             return
-
         account = self.dispatcher.accounts[phone]
         success, message = await account.join_group(group_link)
-
         if success:
             await event.reply(f"✅ {message}")
         else:
@@ -1314,139 +1128,98 @@ class ControlBot:
 
     async def _cmd_stats(self, event, args):
         stats = await self.db.get_stats()
-
         text = (
-            "📊 **إحصائيات البوت**\n\n"
-            f"**الحسابات:**\n"
-            f"• الكل: {stats['total_accounts']}\n"
-            f"• النشطة: {stats['active_accounts']}\n"
-            f"• المفعلة: {stats['enabled_accounts']}\n\n"
-            f"**المحتوى:**\n"
-            f"• الكلمات المفتاحية: {stats['keywords_count']}\n"
-            f"• المحفزات: {stats['triggers_count']}\n"
-            f"• الردود التلقائية: {stats['auto_replies_count']}\n"
-            f"• العبارات المحظورة: {stats['blocked_phrases_count']}\n\n"
-            f"**الحماية:**\n"
-            f"• المستخدمون المحظورون: {stats['blocked_users_count']}\n\n"
-            f"**النشاط (اليوم):**\n"
-            f"• التحويلات: {stats['today_forwards']}\n"
-            f"• الردود: {stats['today_replies']}\n\n"
-            f"**الإجمالي:**\n"
-            f"• التحويلات: {stats['total_forwards']}\n"
-            f"• الردود: {stats['total_replies']}\n\n"
-            f"**المجموعات:** {stats['groups_count']}"
+            f"📊 **الإحصائيات**\n\n"
+            f"**الحسابات:** الكل: {stats.get('total_accounts',0)} | النشطة: {stats.get('active_accounts',0)}\n\n"
+            f"**المحتوى:** كلمات: {stats.get('keywords_count',0)} | محفزات: {stats.get('triggers_count',0)} | ردود: {stats.get('auto_replies_count',0)}\n\n"
+            f"**الحماية:** محظورون: {stats.get('blocked_users_count',0)}\n\n"
+            f"**النشاط اليوم:** تحويلات: {stats.get('today_forwards',0)} | ردود: {stats.get('today_replies',0)}\n\n"
+            f"**الإجمالي:** تحويلات: {stats.get('total_forwards',0)} | ردود: {stats.get('total_replies',0)}"
         )
-
         await event.reply(text)
 
     async def _cmd_reload(self, event, args):
         await self.dispatcher.reload_data()
-        await event.reply("🔄 تم إعادة تحميل الإعدادات بنجاح!")
+        await event.reply("🔄 تم إعادة التحميل!")
 
     async def _cmd_backup(self, event, args):
         try:
             data = await self.db.export_data()
             filename = f"backup_{int(time.time())}.json"
-
             with open(filename, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-
             await self.client.send_file(event.chat_id, filename, caption="📦 نسخة احتياطية")
-
             if os.path.exists(filename):
                 os.remove(filename)
-
         except Exception as e:
-            await event.reply(f"❌ فشل إنشاء النسخة الاحتياطية: {e}")
+            await event.reply(f"❌ فشل: {e}")
 
     async def _cmd_restore(self, event, args):
         if not event.message.media:
-            await event.reply("📎 أرسل ملف النسخة الاحتياطية مع الأمر /restore")
+            await event.reply("📎 أرسل ملف النسخة مع الأمر /restore")
             return
-
         try:
             path = await event.message.download_media()
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-
             success = await self.db.import_data(data)
             if success:
                 await self.dispatcher.reload_data()
-                await event.reply("✅ تم استعادة النسخة الاحتياطية بنجاح!")
+                await event.reply("✅ تم الاستعادة!")
             else:
                 await event.reply("❌ فشل الاستعادة.")
-
             if os.path.exists(path):
                 os.remove(path)
-
         except Exception as e:
-            await event.reply(f"❌ فشل الاستعادة: {e}")
+            await event.reply(f"❌ فشل: {e}")
 
     async def _cmd_set_threshold(self, event, args):
         if not args:
-            await event.reply(f"العتبة الحالية: `{self.config.AUTO_BLOCK_THRESHOLD}` ردود قبل الحظر التلقائي")
+            await event.reply(f"العتبة الحالية: `{self.config.AUTO_BLOCK_THRESHOLD}`")
             return
-
         try:
             threshold = int(args[0])
         except ValueError:
-            await event.reply("❌ القيمة يجب أن تكون رقماً.")
+            await event.reply("❌ رقم غير صالح.")
             return
-
         self.config.AUTO_BLOCK_THRESHOLD = threshold
         await self.db.set_setting('auto_block_threshold', str(threshold))
-        await event.reply(f"✅ تم تعيين عتبة الحظر التلقائي إلى `{threshold}`.")
+        await event.reply(f"✅ عتبة الحظر ← `{threshold}`")
 
     async def _cmd_metrics(self, event, args):
         stats = self.dispatcher.get_stats()
-
         text = (
-            "⚡ **مقاييس الأداء**\n\n"
-            f"• الرسائل المطابقة: {stats.get('messages_matched', 0)}\n"
-            f"• التحويلات المرسلة: {stats.get('forwards_sent', 0)}\n"
-            f"• الردود المرسلة: {stats.get('replies_sent', 0)}\n"
-            f"• طابور التحويلات: {stats.get('forward_queue_size', 0)}\n"
-            f"• طابور الردود: {stats.get('reply_queue_size', 0)}\n"
-            f"• المعالجات النشطة: {stats.get('processed_ids_count', 0)}\n"
-            f"• الحسابات النشطة: {stats.get('active_accounts', 0)}\n"
+            f"⚡ **مقاييس الأداء**\n\n"
+            f"• رسائل مطابقة: {stats.get('messages_matched', 0)}\n"
+            f"• تحويلات: {stats.get('forwards_sent', 0)}\n"
+            f"• ردود: {stats.get('replies_sent', 0)}\n"
+            f"• حسابات نشطة: {stats.get('active_accounts', 0)}"
         )
-
-        if 'process_avg' in stats:
-            text += f"• متوسط وقت المعالجة: {stats['process_avg']:.3f} ثانية\n"
-
         await event.reply(text)
 
     async def _cmd_broadcast(self, event, args):
         if not args:
             await event.reply("⚠️ استخدم: `/broadcast <message>`")
             return
-
         message = " ".join(args)
         sent = 0
-        failed = 0
-
         for phone, account in self.dispatcher.accounts.items():
-            if not account.is_active or not account.target_group_id:
-                continue
-            try:
-                await account.client.send_message(account.target_group_id, message)
-                sent += 1
-            except Exception:
-                failed += 1
-
-        await event.reply(f"✅ تم الإرسال إلى {sent} مجموعة. ❌ فشل: {failed}")
+            if account.is_active and account.target_group_id:
+                try:
+                    await account.client.send_message(account.target_group_id, message)
+                    sent += 1
+                except Exception:
+                    pass
+        await event.reply(f"✅ تم الإرسال إلى {sent} مجموعة.")
 
     async def _handle_pending_op(self, user_id: int, text: str, event: events.NewMessage.Event):
-        """Handle pending multi-step operations"""
         op = self._pending_ops[user_id]
         op_type = op.get('op')
         step = op.get('step', 1)
-
         if text == '/cancel':
             del self._pending_ops[user_id]
-            await event.reply("❌ تم إلغاء العملية.")
+            await event.reply("❌ تم الإلغاء.")
             return
-
         if op_type == 'add_account':
             if step == 1:
                 try:
@@ -1454,47 +1227,33 @@ class ControlBot:
                     op['step'] = 2
                     await event.reply("الخطوة 2/4: أرسل API HASH:")
                 except ValueError:
-                    await event.reply("❌ API ID يجب أن يكون رقماً. أعد المحاولة:")
-
+                    await event.reply("❌ API ID يجب أن يكون رقماً.")
             elif step == 2:
                 op['data']['api_hash'] = text
                 op['step'] = 3
-                await event.reply("الخطوة 3/4: أرسل رقم الهاتف (مع رمز الدولة مثلاً +966XXXXXXXXX):")
-
+                await event.reply("الخطوة 3/4: أرسل رقم الهاتف (+966XXXXXXXXX):")
             elif step == 3:
                 op['data']['phone'] = format_phone(text)
                 op['step'] = 4
-                await event.reply("الخطوة 4/4: أرسل معرف مجموعة الهدف (أو اكتب 0):")
-
+                await event.reply("الخطوة 4/4: أرسل معرف مجموعة الهدف (أو 0):")
             elif step == 4:
                 try:
                     target = int(text)
                     op['data']['target_group_id'] = target
-
-                    # Save account
                     success = await self.db.add_account(
                         phone=op['data']['phone'],
                         api_id=op['data']['api_id'],
                         api_hash=op['data']['api_hash'],
-                        target_group_id=target,
-                        mode='both'
+                        target_group_id=target, mode='both'
                     )
-
                     del self._pending_ops[user_id]
-
+                    phone = op['data']['phone']
                     if success:
-                        phone = op['data']['phone']
-                        await event.reply(
-                            f"✅ **تم إضافة الحساب بنجاح!**\n\n"
-                            f"📱 الهاتف: `{phone}`\n"
-                            f"🎯 المجموعة: `{target}`\n\n"
-                            f"استخدم `/startacc {phone}` لتشغيله."
-                        )
+                        await event.reply(f"✅ **تم الإضافة!**\n📱 `{phone}`\nاستخدم `/startacc {phone}` لتشغيله.")
                     else:
-                        await event.reply("❌ فشل إضافة الحساب.")
-
+                        await event.reply("❌ فشل.")
                 except ValueError:
-                    await event.reply("❌ يجب أن يكون رقماً. أعد المحاولة:")
+                    await event.reply("❌ يجب أن يكون رقماً.")
 
 
 # ============== Main Manager ==============
@@ -1511,59 +1270,41 @@ class TelegramBotManager:
         self._shutdown_event = asyncio.Event()
 
     async def start(self):
-        """Start the bot manager"""
         logger.info("=" * 50)
-        logger.info("Telegram Multi-Account Bot Starting...")
+        logger.info("Bot Starting...")
         logger.info("=" * 50)
 
-        # Create directories
         os.makedirs("sessions", exist_ok=True)
         os.makedirs("backups", exist_ok=True)
 
-        # Initialize database
         await self.db.initialize()
         logger.info("Database initialized")
 
-        # Initialize dispatcher
         await self.dispatcher.initialize()
 
-        # Start control bot
         if self.config.BOT_TOKEN and self.config.API_ID and self.config.API_HASH:
             self.control_bot = ControlBot(
-                self.config.BOT_TOKEN,
-                self.config.API_ID,
-                self.config.API_HASH,
-                self.db,
-                self.dispatcher,
-                self.config
+                self.config.BOT_TOKEN, self.config.API_ID, self.config.API_HASH,
+                self.db, self.dispatcher, self.config
             )
-
-            # Start control bot and saved accounts in background
             asyncio.create_task(self.control_bot.start())
             asyncio.create_task(self._start_saved_accounts())
         else:
-            logger.warning("Control bot not configured. Set BOT_TOKEN, API_ID, API_HASH")
+            logger.warning("Control bot not configured.")
 
         self._running = True
-        logger.info("Bot manager started successfully!")
-
-        # Keep running until shutdown
+        logger.info("Bot manager started!")
         await self._shutdown_event.wait()
 
     async def _start_saved_accounts(self):
-        """Start accounts that were previously enabled"""
-        await asyncio.sleep(3)  # Wait for dispatcher to be ready
-
+        await asyncio.sleep(3)
         accounts = await self.db.get_enabled_accounts()
         logger.info(f"Found {len(accounts)} enabled accounts to auto-start")
-
         for acc_data in accounts:
             try:
-                # Check if has session string
                 if not acc_data.get('session_string'):
-                    logger.info(f"Account {acc_data['phone']} has no session, skipping auto-start")
+                    logger.info(f"Account {acc_data['phone']} has no session, skipping")
                     continue
-
                 account = AccountSession(
                     phone=acc_data['phone'],
                     api_id=acc_data['api_id'],
@@ -1573,39 +1314,26 @@ class TelegramBotManager:
                     db=self.db,
                     session_string=acc_data['session_string']
                 )
-
                 success = await account.create_client()
                 if success:
                     self.dispatcher.register_account(account)
-                    logger.info(f"Auto-started account: {account.phone}")
-                else:
-                    logger.warning(f"Failed to auto-start {acc_data['phone']}: {account.last_error}")
-
-                await asyncio.sleep(1)  # Small delay between accounts
-
+                    logger.info(f"Auto-started: {account.phone}")
+                await asyncio.sleep(1)
             except Exception as e:
-                logger.error(f"Failed to auto-start account {acc_data.get('phone', '?')}: {e}")
+                logger.error(f"Failed to auto-start {acc_data.get('phone', '?')}: {e}")
 
     async def stop(self):
-        """Stop the bot manager"""
         logger.info("Shutting down...")
         self._running = False
         self._shutdown_event.set()
-
-        # Shutdown dispatcher
         await self.dispatcher.shutdown()
-
-        # Stop all accounts
         for phone, account in list(self.dispatcher.accounts.items()):
             try:
                 await account.disconnect()
             except Exception:
                 pass
-
-        # Close database
         await self.db.close()
-
-        logger.info("Bot manager stopped")
+        logger.info("Bot stopped")
 
 
 # ============== Entry Point ==============
@@ -1623,7 +1351,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(manager.start())
     except KeyboardInterrupt:
-        logger.info("Shutdown requested by user")
+        logger.info("Shutdown requested")
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
